@@ -2,6 +2,7 @@ from torch.backends import cudnn
 
 from .data import *
 
+import math
 import time
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
@@ -22,6 +23,31 @@ def getLog(log_path, str):
         log.write('\n')
 
 
+def _build_optimizer(net, lr):
+    optimizer_name = (config.get_value('optimizer_name') or 'adam').lower()
+    weight_decay = config.get_value('weight_decay') or 0.0
+    if optimizer_name == 'adamw':
+        return torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    return torch.optim.Adam(net.parameters(), lr=lr)
+
+
+def _build_lr_scheduler(optimizer, epochs, warmup_epochs, min_lr):
+    warmup_epochs = max(0, min(warmup_epochs, max(epochs - 1, 0)))
+
+    def lr_lambda(epoch):
+        if epochs <= 1:
+            return 1.0
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return float(epoch + 1) / float(warmup_epochs)
+        cosine_total = max(1, epochs - warmup_epochs)
+        cosine_epoch = max(0, epoch - warmup_epochs)
+        min_factor = min_lr if min_lr > 0 else 0.0
+        cosine = 0.5 * (1.0 + math.cos(math.pi * cosine_epoch / cosine_total))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, model_savepath, log_path, hsi_pca_wight, datasetType):
     device = torch.device(cuda if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -35,8 +61,19 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
     net = model_bundle["net"]
     net.to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(label_smoothing=config.get_value('label_smoothing') or 0.0)
+    optimizer = _build_optimizer(net, lr)
+    warmup_epochs = config.get_value('warmup_epochs') or 0
+    min_lr = config.get_value('min_lr') or 0.0
+    use_scheduler = warmup_epochs > 0 or min_lr > 0
+    scheduler = None
+    if use_scheduler:
+        scheduler = _build_lr_scheduler(
+            optimizer,
+            epochs=epochs,
+            warmup_epochs=warmup_epochs,
+            min_lr=max(min_lr / max(lr, 1e-12), 0.0),
+        )
     max_acc = 0
     sum_time = 0
 
@@ -68,6 +105,9 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
 
             loss.backward()
             optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch % 1 == 0:
             net.eval()
@@ -104,7 +144,7 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
             sum_time += time_elapsed
             rest_time = (sum_time / (epoch + 1)) * (epochs - epoch - 1)
             currentTime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-            log = currentTime + ' [Epoch: %d] [%.0fs, %.0fh %.0fm %.0fs] [current loss: %.4f] acc: %.4f' %(epoch + 1, time_elapsed, (rest_time // 60) // 60, (rest_time // 60) % 60, rest_time % 60, loss.item(), acc1)
+            log = currentTime + ' [Epoch: %d] [%.0fs, %.0fh %.0fm %.0fs] [lr: %.7f] [current loss: %.4f] acc: %.4f' %(epoch + 1, time_elapsed, (rest_time // 60) // 60, (rest_time // 60) % 60, rest_time % 60, optimizer.param_groups[0]['lr'], loss.item(), acc1)
             print(log)
             getLog(log_path, log)
 
