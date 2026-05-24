@@ -6,7 +6,7 @@
 import os
 import json
 import argparse
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 
@@ -51,12 +51,21 @@ class ExperimentConfig:
     window_size: int = 11
     depth: List[List[int]] = None
 
-    # 功能开关
+    # 优化参数（默认保持原始训练策略，避免影响对比实验）
+    optimizer_name: str = "adam"
+    weight_decay: float = 0.0
+    label_smoothing: float = 0.0
+    warmup_epochs: int = 0
+    min_learning_rate: float = 0.0
     enable_training: bool = True
     enable_testing: bool = True
     enable_visualization: bool = True
     enable_tsne: bool = False
     enable_erf: bool = False
+
+    # 邮件通知配置
+    enable_email_notification: bool = False
+    email_recipient_override: str = ""
 
     # 数据集信息 (自动根据dataset_type设置)
     out_features: List[int] = None
@@ -146,11 +155,18 @@ class ConfigManager:
             'batch_size': self.config.batch_size,
             'num_workers': self.config.num_workers,
             'random_seed': self.config.random_seed,
+            'optimizer_name': self.config.optimizer_name,
+            'weight_decay': self.config.weight_decay,
+            'label_smoothing': self.config.label_smoothing,
+            'warmup_epochs': self.config.warmup_epochs,
+            'min_lr': self.config.min_learning_rate,
 
             # 功能开关
             'visualization': self.config.enable_visualization,
             'tsne': self.config.enable_tsne,
             'erf': self.config.enable_erf,
+            'enable_email_notification': self.config.enable_email_notification,
+            'email_recipient_override': self.config.email_recipient_override,
 
             # 数据集信息
             'data_channels': self.config.data_channels,
@@ -193,6 +209,16 @@ class ConfigManager:
             self.config.enable_tsne = value
         elif key == 'erf':
             self.config.enable_erf = value
+        elif key == 'optimizer_name':
+            self.config.optimizer_name = value
+        elif key == 'weight_decay':
+            self.config.weight_decay = value
+        elif key == 'label_smoothing':
+            self.config.label_smoothing = value
+        elif key == 'warmup_epochs':
+            self.config.warmup_epochs = value
+        elif key == 'min_lr':
+            self.config.min_learning_rate = value
 
         # 重新创建参数字典以确保同步
         self._parameter_dict = self._create_parameter_dict()
@@ -205,6 +231,11 @@ class ConfigManager:
             f'epoch_nums:\t{self.config.epochs}\n'
             f'batch_size:\t{self.config.batch_size}\n'
             f'window_size:\t{self.config.window_size}\n'
+            f'optimizer_name:\t{self.config.optimizer_name}\n'
+            f'weight_decay:\t{self.config.weight_decay}\n'
+            f'label_smoothing:\t{self.config.label_smoothing}\n'
+            f'warmup_epochs:\t{self.config.warmup_epochs}\n'
+            f'min_learning_rate:\t{self.config.min_learning_rate}\n'
             f'depth:\t{self.config.depth}\n'
             '------------------------------------------------------'
         )
@@ -238,6 +269,11 @@ class ConfigManager:
             'batch_size': 'batch_size',
             'channels': 'channels',
             'window_size': 'window_size',
+            'optimizer': 'optimizer_name',
+            'weight_decay': 'weight_decay',
+            'label_smoothing': 'label_smoothing',
+            'warmup_epochs': 'warmup_epochs',
+            'min_lr': 'min_learning_rate',
         }
 
         for arg_name, config_field in arg_mapping.items():
@@ -302,7 +338,7 @@ def get_config_manager() -> ConfigManager:
     return _global_config_manager
 
 def create_experiment_config_from_cli() -> ExperimentConfig:
-    """从命令行创建实验配置"""
+    """从命令行或配置文件创建实验配置"""
     parser = argparse.ArgumentParser(description='高光谱分类实验配置')
     dataset_help = '数据集类型: ' + ', '.join([f'{idx}={name}' for idx, name in DATASET_LABELS.items()])
     model_choices = sorted(MODEL_REGISTRY.keys())
@@ -329,6 +365,16 @@ def create_experiment_config_from_cli() -> ExperimentConfig:
                        help='PCA通道数')
     parser.add_argument('--window-size', type=int, default=11,
                        help='窗口大小')
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
+                       help='优化器类型')
+    parser.add_argument('--weight-decay', type=float, default=0.0,
+                       help='权重衰减')
+    parser.add_argument('--label-smoothing', type=float, default=0.0,
+                       help='标签平滑')
+    parser.add_argument('--warmup-epochs', type=int, default=0,
+                       help='warmup轮数')
+    parser.add_argument('--min-lr', type=float, default=0.0,
+                       help='余弦退火最小学习率')
 
     # 功能开关
     parser.add_argument('--no-visualization', action='store_true',
@@ -348,18 +394,23 @@ def create_experiment_config_from_cli() -> ExperimentConfig:
 
     args = parser.parse_args()
 
-    # 如果指定了配置文件，优先加载
-    if args.config and Path(args.config).exists():
+    default_config_path = PROJECT_ROOT / 'configs' / 'train.json'
+    if args.config:
+        config_path = Path(args.config)
+    elif default_config_path.exists():
+        config_path = default_config_path
+    else:
+        config_path = None
+
+    if config_path and config_path.exists():
         manager = ConfigManager()
-        manager.load_config(args.config)
+        manager.load_config(str(config_path))
         config = manager.config
     else:
-        # 从命令行参数创建配置
         manager = ConfigManager()
         manager.create_from_args(args)
         config = manager.config
 
-    # 如果指定了保存路径，保存配置
     if args.save_config:
         manager = ConfigManager(config)
         manager.save_config(args.save_config)

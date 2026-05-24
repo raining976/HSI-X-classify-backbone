@@ -13,6 +13,7 @@ MODEL_REGISTRY = {
     "HCTNet": "src.models.hctnet.adapter",
     "MACN": "src.models.macn.adapter",
     "RSCNet": "src.models.rscnet.adapter",
+    "BalancedGMambaHX": "src.models.balanced_gmamba_hx.adapter",
 }
 
 
