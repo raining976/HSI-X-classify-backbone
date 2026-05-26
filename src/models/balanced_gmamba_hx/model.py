@@ -80,6 +80,23 @@ class LearnableChannelFusion(nn.Module):
         return weight * a + (1.0 - weight) * b
 
 
+class FrequencyAwareResidualFusion(nn.Module):
+    def __init__(self, embed_dim, reduction=4):
+        super().__init__()
+        hidden_dim = max(1, embed_dim // reduction)
+        self.alpha_conv = nn.Sequential(
+            nn.Conv2d(embed_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, embed_dim * 2, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, residual_spatial, fusion_spatial, scanned_spatial):
+        enhanced_spatial = fusion_spatial + scanned_spatial
+        alpha1, alpha2 = self.alpha_conv(enhanced_spatial).chunk(2, dim=1)
+        return alpha1 * residual_spatial + alpha2 * enhanced_spatial
+
+
 class MambaTokenMixer(nn.Module):
     def __init__(self, embed_dim, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -292,6 +309,7 @@ class BalancedGMambaBlock(nn.Module):
         self.x_low_weight = nn.Parameter(torch.zeros(embed_dim))
         self.x_high_weight = nn.Parameter(torch.zeros(embed_dim))
         self.spatial_scan = SpatialMamba2D(embed_dim)
+        self.spatial_residual_fusion = FrequencyAwareResidualFusion(embed_dim)
         self.token_mixer = MambaTokenMixer(embed_dim)
         self.out_act = nn.GELU()
 
@@ -310,7 +328,8 @@ class BalancedGMambaBlock(nn.Module):
         x_high_weight = torch.sigmoid(self.x_high_weight).view(1, -1, 1, 1)
         x_freq = self.x_band_fusion(x_low * x_low_weight, x_high * x_high_weight)
         fusion_spatial = self.hsi_x_spatial_fusion(hsi_freq, x_freq)
-        fusion_spatial = self.out_act(residual_spatial + fusion_spatial + self.spatial_scan(fusion_spatial))
+        scanned_spatial = self.spatial_scan(fusion_spatial)
+        fusion_spatial = self.out_act(self.spatial_residual_fusion(residual_spatial, fusion_spatial, scanned_spatial))
 
         spec_tokens = self.token_mixer(spec_tokens + hsi_spec_low + hsi_spec_high)
         spec_tokens = spec_tokens + residual_tokens
@@ -372,7 +391,7 @@ class BalancedFusionHead(nn.Module):
         return self.classifier(fused)
 
 
-class BalancedGMambaHX(nn.Module):
+class BalancedGMambaHX(nn.Module): 
     def __init__(
         self,
         hsi_channels,
