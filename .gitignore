@@ -33,3 +33,7 @@ data/
 *.out
 *.err
 email_config.json
+
+
+# Claude local files
+.claude/
