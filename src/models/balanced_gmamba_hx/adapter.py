@@ -9,6 +9,7 @@ def build_model(config, dataset_type, device):
     pca_channels = config.get_value('channels')
     aux_channels = config.get_value('lidar_or_sar_channels')[dataset_type]
     num_classes = config.get_value('out_features')[dataset_type]
+    stage_depths = config.get_value('balanced_gmamba_hx_stage_depths') or [1, 2]
     net = BalancedGMambaHX(
         hsi_channels=hsi_channels,
         pca_channels=pca_channels,
@@ -16,7 +17,7 @@ def build_model(config, dataset_type, device):
         num_classes=num_classes,
         embed_dim=64,
         stem_dim=16,
-        stage_depths=(2, 2, 2),
+        stage_depths=tuple(stage_depths),
     )
     return {"net": net}
 

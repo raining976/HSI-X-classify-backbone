@@ -37,3 +37,8 @@ email_config.json
 
 # Claude local files
 .claude/
+
+# test files
+test_*.py
+test_*.ipynb
+*.png

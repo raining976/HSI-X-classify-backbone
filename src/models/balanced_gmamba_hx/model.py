@@ -295,45 +295,63 @@ class SpatialMamba2D(nn.Module):
         return self.fuse(torch.cat([row_fwd, row_rev, col_fwd, col_rev], dim=1))
 
 
-class BalancedGMambaBlock(nn.Module):
+class SpectralGuidedFrequencyFusion(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.hsi_local = DepthwiseResidual2d(embed_dim)
         self.x_local = DepthwiseResidual2d(embed_dim)
-        self.hsi_pca_fusion = LearnableChannelFusion(embed_dim, token_mode=True)
-        self.hsi_spectral_guide = HSISpectralGuide(embed_dim)
+        self.token_calibration = LearnableChannelFusion(embed_dim, token_mode=True)
+        self.spectral_guide = HSISpectralGuide(embed_dim)
         self.spatial_decomposer = DualModalSpatialFrequencyDecomposer(embed_dim)
         self.hsi_band_fusion = LearnableChannelFusion(embed_dim)
         self.x_band_fusion = LearnableChannelFusion(embed_dim)
-        self.hsi_x_spatial_fusion = LearnableChannelFusion(embed_dim)
+        self.cross_modal_fusion = LearnableChannelFusion(embed_dim)
         self.x_low_weight = nn.Parameter(torch.zeros(embed_dim))
         self.x_high_weight = nn.Parameter(torch.zeros(embed_dim))
-        self.spatial_scan = SpatialMamba2D(embed_dim)
-        self.spatial_residual_fusion = FrequencyAwareResidualFusion(embed_dim)
-        self.token_mixer = MambaTokenMixer(embed_dim)
-        self.out_act = nn.GELU()
 
     def forward(self, hsi_spatial, x_spatial, spec_tokens, pca_tokens):
-        residual_spatial = hsi_spatial
-        residual_tokens = spec_tokens
         hsi_spatial = self.hsi_local(hsi_spatial)
         x_spatial = self.x_local(x_spatial)
 
-        spec_tokens = self.hsi_pca_fusion(spec_tokens, pca_tokens)
-        hsi_spec_low, hsi_spec_high, low_guide, high_guide = self.hsi_spectral_guide(spec_tokens)
+        spec_tokens = self.token_calibration(spec_tokens, pca_tokens)
+        hsi_spec_low, hsi_spec_high, low_guide, high_guide = self.spectral_guide(spec_tokens)
         hsi_low, hsi_high, x_low, x_high = self.spatial_decomposer(hsi_spatial, x_spatial)
 
         hsi_freq = self.hsi_band_fusion(hsi_low * low_guide, hsi_high * high_guide)
         x_low_weight = torch.sigmoid(self.x_low_weight).view(1, -1, 1, 1)
         x_high_weight = torch.sigmoid(self.x_high_weight).view(1, -1, 1, 1)
         x_freq = self.x_band_fusion(x_low * x_low_weight, x_high * x_high_weight)
-        fusion_spatial = self.hsi_x_spatial_fusion(hsi_freq, x_freq)
+        fusion_spatial = self.cross_modal_fusion(hsi_freq, x_freq)
+        spec_tokens = spec_tokens + hsi_spec_low + hsi_spec_high
+        return fusion_spatial, spec_tokens
+
+
+class SpatialSpectralStateModeling(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.spatial_scan = SpatialMamba2D(embed_dim)
+        self.spatial_residual_fusion = FrequencyAwareResidualFusion(embed_dim)
+        self.token_mixer = MambaTokenMixer(embed_dim)
+        self.out_act = nn.GELU()
+
+    def forward(self, residual_spatial, fusion_spatial, spec_tokens, residual_tokens):
         scanned_spatial = self.spatial_scan(fusion_spatial)
         fusion_spatial = self.out_act(self.spatial_residual_fusion(residual_spatial, fusion_spatial, scanned_spatial))
-
-        spec_tokens = self.token_mixer(spec_tokens + hsi_spec_low + hsi_spec_high)
-        spec_tokens = spec_tokens + residual_tokens
+        spec_tokens = self.token_mixer(spec_tokens) + residual_tokens
         return fusion_spatial, spec_tokens
+
+
+class BalancedGMambaBlock(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.sgff = SpectralGuidedFrequencyFusion(embed_dim)
+        self.s3m = SpatialSpectralStateModeling(embed_dim)
+
+    def forward(self, hsi_spatial, x_spatial, spec_tokens, pca_tokens):
+        residual_spatial = hsi_spatial
+        residual_tokens = spec_tokens
+        fusion_spatial, spec_tokens = self.sgff(hsi_spatial, x_spatial, spec_tokens, pca_tokens)
+        return self.s3m(residual_spatial, fusion_spatial, spec_tokens, residual_tokens)
 
 
 class BalancedGMambaStage(nn.Module):
@@ -409,12 +427,16 @@ class BalancedGMambaHX(nn.Module):
         self.pca_stem = PCABalancedTokenStem(in_channels=pca_channels, embed_dim=embed_dim, token_count=spec_tokens)
         self.x_stem = XBalancedStem(in_channels=aux_channels, embed_dim=embed_dim, token_count=spec_tokens)
         self.initial_spec_fusion = LearnableChannelFusion(embed_dim, token_mode=True)
-        self.stage1 = BalancedGMambaStage(embed_dim=embed_dim, depth=stage_depths[0])
-        self.downsample1 = DownsampleStage(embed_dim, embed_dim * 2)
-        self.stage2 = BalancedGMambaStage(embed_dim=embed_dim * 2, depth=stage_depths[1])
-        self.downsample2 = DownsampleStage(embed_dim * 2, embed_dim * 4)
-        self.stage3 = BalancedGMambaStage(embed_dim=embed_dim * 4, depth=stage_depths[2])
-        self.head = BalancedFusionHead(embed_dim=embed_dim * 4, num_classes=num_classes)
+        stage_dims = [embed_dim * (2 ** idx) for idx in range(len(stage_depths))]
+        self.stages = nn.ModuleList([
+            BalancedGMambaStage(embed_dim=dim, depth=depth)
+            for dim, depth in zip(stage_dims, stage_depths)
+        ])
+        self.downsamples = nn.ModuleList([
+            DownsampleStage(stage_dims[idx], stage_dims[idx + 1])
+            for idx in range(len(stage_dims) - 1)
+        ])
+        self.head = BalancedFusionHead(embed_dim=stage_dims[-1], num_classes=num_classes)
 
     def forward(self, hsi, hsi_pca, aux):
         hsi_spatial, hsi_tokens = self.hsi_stem(hsi)
@@ -422,19 +444,14 @@ class BalancedGMambaHX(nn.Module):
         x_spatial, _ = self.x_stem(aux)
         spec_tokens = self.initial_spec_fusion(hsi_tokens, pca_tokens)
 
-        fusion_spatial, spec_tokens = self.stage1(hsi_spatial, x_spatial, spec_tokens, pca_tokens)
-        fusion_spatial, x_spatial, spec_tokens, pca_tokens = self.downsample1(
-            fusion_spatial,
-            x_spatial,
-            spec_tokens,
-            pca_tokens,
-        )
-        fusion_spatial, spec_tokens = self.stage2(fusion_spatial, x_spatial, spec_tokens, pca_tokens)
-        fusion_spatial, x_spatial, spec_tokens, pca_tokens = self.downsample2(
-            fusion_spatial,
-            x_spatial,
-            spec_tokens,
-            pca_tokens,
-        )
-        fusion_spatial, spec_tokens = self.stage3(fusion_spatial, x_spatial, spec_tokens, pca_tokens)
+        fusion_spatial = hsi_spatial
+        for idx, stage in enumerate(self.stages):
+            fusion_spatial, spec_tokens = stage(fusion_spatial, x_spatial, spec_tokens, pca_tokens)
+            if idx < len(self.downsamples):
+                fusion_spatial, x_spatial, spec_tokens, pca_tokens = self.downsamples[idx](
+                    fusion_spatial,
+                    x_spatial,
+                    spec_tokens,
+                    pca_tokens,
+                )
         return self.head(fusion_spatial, spec_tokens)

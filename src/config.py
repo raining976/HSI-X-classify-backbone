@@ -42,6 +42,7 @@ class ExperimentConfig:
     # 训练参数
     learning_rate: float = 0.0001
     epochs: int = 10
+    actual_epoch_nums: Optional[int] = None
     batch_size: int = 128
     num_workers: int = 0
     random_seed: int = 6
@@ -50,6 +51,7 @@ class ExperimentConfig:
     channels: int = 30
     window_size: int = 11
     depth: List[List[int]] = None
+    balanced_gmamba_hx_stage_depths: List[int] = None
 
     # 优化参数（默认保持原始训练策略，避免影响对比实验）
     optimizer_name: str = "adam"
@@ -62,6 +64,9 @@ class ExperimentConfig:
     enable_visualization: bool = True
     enable_tsne: bool = False
     enable_erf: bool = False
+    enable_early_stopping: bool = False
+    early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 0.005
 
     # 邮件通知配置
     enable_email_notification: bool = False
@@ -83,6 +88,8 @@ class ExperimentConfig:
         """初始化后自动设置默认值"""
         if self.depth is None:
             self.depth = [[2, 2, 2], [2, 2, 2], 2]
+        if self.balanced_gmamba_hx_stage_depths is None:
+            self.balanced_gmamba_hx_stage_depths = [2, 2, 2]
 
         # 数据集相关配置
         self._setup_dataset_config()
@@ -147,11 +154,13 @@ class ConfigManager:
             'windowSize': self.config.window_size,
             'out_features': self.config.out_features,
             'depth': self.config.depth,
+            'balanced_gmamba_hx_stage_depths': self.config.balanced_gmamba_hx_stage_depths,
 
             # 训练参数
             'cuda': self.config.cuda_device,
             'lr': self.config.learning_rate,
             'epoch_nums': self.config.epochs,
+            'actual_epoch_nums': self.config.actual_epoch_nums,
             'batch_size': self.config.batch_size,
             'num_workers': self.config.num_workers,
             'random_seed': self.config.random_seed,
@@ -165,6 +174,9 @@ class ConfigManager:
             'visualization': self.config.enable_visualization,
             'tsne': self.config.enable_tsne,
             'erf': self.config.enable_erf,
+            'enable_early_stopping': self.config.enable_early_stopping,
+            'early_stopping_patience': self.config.early_stopping_patience,
+            'early_stopping_min_delta': self.config.early_stopping_min_delta,
             'enable_email_notification': self.config.enable_email_notification,
             'email_recipient_override': self.config.email_recipient_override,
 
@@ -201,6 +213,8 @@ class ConfigManager:
             self.config.learning_rate = value
         elif key == 'epoch_nums':
             self.config.epochs = value
+        elif key == 'actual_epoch_nums':
+            self.config.actual_epoch_nums = value
         elif key == 'cuda':
             self.config.cuda_device = value
         elif key == 'visualization':
@@ -209,6 +223,12 @@ class ConfigManager:
             self.config.enable_tsne = value
         elif key == 'erf':
             self.config.enable_erf = value
+        elif key == 'enable_early_stopping':
+            self.config.enable_early_stopping = value
+        elif key == 'early_stopping_patience':
+            self.config.early_stopping_patience = value
+        elif key == 'early_stopping_min_delta':
+            self.config.early_stopping_min_delta = value
         elif key == 'optimizer_name':
             self.config.optimizer_name = value
         elif key == 'weight_decay':
@@ -227,6 +247,10 @@ class ConfigManager:
         """获取任务信息，兼容原parameter.py接口"""
         return (
             '-----------------------taskInfo-----------------------\n'
+            f'experiment_name:\t{self.config.experiment_name}\n'
+            f'model_name:\t{self.config.model_name}\n'
+            f'dataset_name:\t{DATASET_LABELS[self.config.dataset_type]}\n'
+            f'balanced_gmamba_hx_stage_depths:\t{self.config.balanced_gmamba_hx_stage_depths}\n'
             f'lr:\t{self.config.learning_rate}\n'
             f'epoch_nums:\t{self.config.epochs}\n'
             f'batch_size:\t{self.config.batch_size}\n'
@@ -236,6 +260,9 @@ class ConfigManager:
             f'label_smoothing:\t{self.config.label_smoothing}\n'
             f'warmup_epochs:\t{self.config.warmup_epochs}\n'
             f'min_learning_rate:\t{self.config.min_learning_rate}\n'
+            f'enable_early_stopping:\t{self.config.enable_early_stopping}\n'
+            f'early_stopping_patience:\t{self.config.early_stopping_patience}\n'
+            f'early_stopping_min_delta:\t{self.config.early_stopping_min_delta}\n'
             f'depth:\t{self.config.depth}\n'
             '------------------------------------------------------'
         )
@@ -274,6 +301,9 @@ class ConfigManager:
             'label_smoothing': 'label_smoothing',
             'warmup_epochs': 'warmup_epochs',
             'min_lr': 'min_learning_rate',
+            'enable_early_stopping': 'enable_early_stopping',
+            'early_stopping_patience': 'early_stopping_patience',
+            'early_stopping_min_delta': 'early_stopping_min_delta',
         }
 
         for arg_name, config_field in arg_mapping.items():

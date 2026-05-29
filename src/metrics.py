@@ -69,6 +69,10 @@ def getReport(datasetType, model_bundle, model_adapter, test_loader, report_path
         report.write('\n')
         report.write('{}'.format(current_time_log))
         report.write('\n')
+        actual_epoch_nums = config.get_value('actual_epoch_nums')
+        if actual_epoch_nums is not None:
+            report.write('Actual training epochs: {}'.format(actual_epoch_nums))
+            report.write('\n')
         report.write('{} Overall accuracy (%)'.format(oa))
         report.write('\n')
         report.write('{} Average accuracy (%)'.format(aa))

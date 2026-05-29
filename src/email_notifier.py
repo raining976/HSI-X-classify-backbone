@@ -27,7 +27,7 @@ def resolve_recipient(email_config: dict, experiment_config) -> str:
     return recipient
 
 
-def extract_report_summary(report_path, max_lines=20) -> str:
+def extract_report_summary(report_path) -> str:
     report_file = Path(report_path)
     if not report_file.exists():
         raise FileNotFoundError(f"报告文件不存在: {report_file}")
@@ -44,7 +44,7 @@ def extract_report_summary(report_path, max_lines=20) -> str:
         raise ValueError("报告中未找到本次实验的起始位置")
 
     summary_lines = []
-    for line in lines[report_start:report_start + max_lines]:
+    for line in lines[report_start:]:
         summary_lines.append(line)
         if "Kappa accuracy (%)" in line:
             break

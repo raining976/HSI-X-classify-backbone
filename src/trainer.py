@@ -14,6 +14,25 @@ import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
 
+class EarlyStopping:
+    def __init__(self, enabled=False, patience=10, min_delta=0.005):
+        self.enabled = enabled
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = None
+        self.wait = 0
+
+    def should_stop(self, metric):
+        if not self.enabled:
+            return False
+        if self.best is None or metric - self.best >= self.min_delta:
+            self.best = metric
+            self.wait = 0
+            return False
+        self.wait += 1
+        return self.wait >= self.patience
+
+
 def getLog(log_path, str):
     import os
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -75,6 +94,11 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
             min_lr=max(min_lr / max(lr, 1e-12), 0.0),
         )
     max_acc = 0
+    early_stopping = EarlyStopping(
+        enabled=bool(config.get_value('enable_early_stopping')),
+        patience=config.get_value('early_stopping_patience') or 10,
+        min_delta=config.get_value('early_stopping_min_delta') or 0.005,
+    )
     sum_time = 0
 
     current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
@@ -83,6 +107,7 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
     getLog(log_path, '-------------------Started Training-------------------')
     getLog(log_path, current_time_log)
 
+    config.set_value('actual_epoch_nums', 0)
     for epoch in range(epochs):
         since = time.time()
         net.train()
@@ -134,6 +159,7 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
                     gty = np.concatenate((gty, gtlabels))
 
             acc1 = accuracy_score(gty, y_pred_test)
+            config.set_value('actual_epoch_nums', epoch + 1)
 
             if acc1 > max_acc:
                 os.makedirs(os.path.dirname(model_savepath), exist_ok=True)
@@ -147,6 +173,11 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
             log = currentTime + ' [Epoch: %d] [%.0fs, %.0fh %.0fm %.0fs] [lr: %.7f] [current loss: %.4f] acc: %.4f' %(epoch + 1, time_elapsed, (rest_time // 60) // 60, (rest_time // 60) % 60, rest_time % 60, optimizer.param_groups[0]['lr'], loss.item(), acc1)
             print(log)
             getLog(log_path, log)
+            if early_stopping.should_stop(acc1):
+                stop_log = 'Early stopping triggered at epoch {} with acc: {:.4f}'.format(epoch + 1, acc1)
+                print(stop_log)
+                getLog(log_path, stop_log)
+                break
 
     print('max_acc: %.4f' %(max_acc))
     finish_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
