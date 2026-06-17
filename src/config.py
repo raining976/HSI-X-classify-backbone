@@ -51,7 +51,7 @@ class ExperimentConfig:
     channels: int = 30
     window_size: int = 11
     depth: List[List[int]] = None
-    balanced_gmamba_hx_stage_depths: List[int] = None
+    ssfuse_mamba_stage_depths: List[int] = None
 
     # 优化参数（默认保持原始训练策略，避免影响对比实验）
     optimizer_name: str = "adam"
@@ -88,8 +88,8 @@ class ExperimentConfig:
         """初始化后自动设置默认值"""
         if self.depth is None:
             self.depth = [[2, 2, 2], [2, 2, 2], 2]
-        if self.balanced_gmamba_hx_stage_depths is None:
-            self.balanced_gmamba_hx_stage_depths = [2, 2, 2]
+        if self.ssfuse_mamba_stage_depths is None:
+            self.ssfuse_mamba_stage_depths = [2, 2, 2]
 
         # 数据集相关配置
         self._setup_dataset_config()
@@ -154,7 +154,7 @@ class ConfigManager:
             'windowSize': self.config.window_size,
             'out_features': self.config.out_features,
             'depth': self.config.depth,
-            'balanced_gmamba_hx_stage_depths': self.config.balanced_gmamba_hx_stage_depths,
+            'ssfuse_mamba_stage_depths': self.config.ssfuse_mamba_stage_depths,
 
             # 训练参数
             'cuda': self.config.cuda_device,
@@ -250,7 +250,7 @@ class ConfigManager:
             f'experiment_name:\t{self.config.experiment_name}\n'
             f'model_name:\t{self.config.model_name}\n'
             f'dataset_name:\t{DATASET_LABELS[self.config.dataset_type]}\n'
-            f'balanced_gmamba_hx_stage_depths:\t{self.config.balanced_gmamba_hx_stage_depths}\n'
+            f'ssfuse_mamba_stage_depths:\t{self.config.ssfuse_mamba_stage_depths}\n'
             f'lr:\t{self.config.learning_rate}\n'
             f'epoch_nums:\t{self.config.epochs}\n'
             f'batch_size:\t{self.config.batch_size}\n'
