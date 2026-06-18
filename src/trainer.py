@@ -67,6 +67,16 @@ def _build_lr_scheduler(optimizer, epochs, warmup_epochs, min_lr):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def _format_parameter_count(net):
+    total_params = sum(param.numel() for param in net.parameters())
+    trainable_params = sum(param.numel() for param in net.parameters() if param.requires_grad)
+    return (
+        'model parameters: '
+        f'total={total_params:,} ({total_params / 1_000_000:.3f}M), '
+        f'trainable={trainable_params:,} ({trainable_params / 1_000_000:.3f}M)'
+    )
+
+
 def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, model_savepath, log_path, hsi_pca_wight, datasetType):
     device = torch.device(cuda if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -79,6 +89,8 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
     model_bundle = model_adapter.build_model(config, datasetType, device)
     net = model_bundle["net"]
     net.to(device)
+    param_count_log = _format_parameter_count(net)
+    print(param_count_log)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=config.get_value('label_smoothing') or 0.0)
     optimizer = _build_optimizer(net, lr)
@@ -106,6 +118,7 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
     getLog(log_path, config.get_taskInfo())
     getLog(log_path, '-------------------Started Training-------------------')
     getLog(log_path, current_time_log)
+    getLog(log_path, param_count_log)
 
     config.set_value('actual_epoch_nums', 0)
     for epoch in range(epochs):
