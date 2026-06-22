@@ -16,7 +16,7 @@ def build_model(config, dataset_type, device):
         num_classes=num_classes,
         hsi_channels=hsi_channels,
         embed_dim=48,
-        stem_dim=16,
+        stem_dim=32,
         stage_depths=tuple(stage_depths),
     )
     return {"net": net}
