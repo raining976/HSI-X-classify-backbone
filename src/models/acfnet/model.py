@@ -20,9 +20,31 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
+def cross_attention_weights(logits, attention_mode):
+    if attention_mode == "softmax":
+        return torch.softmax(logits, dim=-1)
+    if attention_mode != "mutual_consistency":
+        raise ValueError(f"Unsupported attention mode: {attention_mode}")
+
+    original_dtype = logits.dtype
+    work_logits = logits.float() if logits.dtype in (torch.float16, torch.bfloat16) else logits
+    row_attention = torch.softmax(work_logits, dim=-1)
+    column_attention = torch.softmax(work_logits, dim=-2)
+    mutual = torch.sqrt(
+        (row_attention * column_attention).clamp_min(torch.finfo(work_logits.dtype).tiny)
+    )
+    row_mass = mutual.sum(dim=-1, keepdim=True)
+    normalized_mutual = mutual / row_mass.clamp_min(torch.finfo(work_logits.dtype).eps)
+    shared_confidence = row_mass.clamp(max=1.0)
+    return (normalized_mutual * shared_confidence).to(original_dtype)
+
+
 class SpatialCrossEnhance(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, attention_mode="mutual_consistency"):
         super().__init__()
+        if attention_mode not in {"softmax", "mutual_consistency"}:
+            raise ValueError(f"Unsupported attention mode: {attention_mode}")
+        self.attention_mode = attention_mode
         self.q_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
@@ -40,7 +62,8 @@ class SpatialCrossEnhance(nn.Module):
         _, c, _, _ = pca_feat.shape
         q = self.q_proj(pca_feat).flatten(2).transpose(1, 2)
         k = self.k_proj(x_feat).flatten(2).transpose(1, 2)
-        return torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(c), dim=-1)
+        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(c)
+        return cross_attention_weights(logits, self.attention_mode)
 
     def apply(self, attn, value_feat, proj):
         b, c, h, w = value_feat.shape
@@ -48,8 +71,14 @@ class SpatialCrossEnhance(nn.Module):
         enhanced = torch.matmul(attn, v).transpose(1, 2).reshape(b, c, h, w)
         return proj(enhanced)
 
+    @staticmethod
+    def shared_confidence(attn, height, width):
+        return attn.sum(dim=-1).reshape(attn.shape[0], 1, height, width)
+
     def fusion_feature(self, pca_feat, x_feat, attn):
-        return pca_feat + self.apply(attn, x_feat, self.apply_proj)
+        _, _, h, w = pca_feat.shape
+        shared_base = pca_feat * self.shared_confidence(attn, h, w)
+        return shared_base + self.apply(attn, x_feat, self.apply_proj)
 
     def extract(self, fusion_feat, attn):
         return self.apply(attn, fusion_feat, self.extract_proj)
@@ -61,8 +90,11 @@ class SpatialCrossEnhance(nn.Module):
 
 
 class ChannelCrossEnhance(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, attention_mode="mutual_consistency"):
         super().__init__()
+        if attention_mode not in {"softmax", "mutual_consistency"}:
+            raise ValueError(f"Unsupported attention mode: {attention_mode}")
+        self.attention_mode = attention_mode
         self.q_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
@@ -84,7 +116,8 @@ class ChannelCrossEnhance(nn.Module):
 
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
-        return torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(n), dim=-1)
+        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(n)
+        return cross_attention_weights(logits, self.attention_mode)
 
     def apply(self, attn, value_feat, proj):
         b, c, h, w = value_feat.shape
@@ -92,8 +125,13 @@ class ChannelCrossEnhance(nn.Module):
         enhanced = torch.matmul(attn, v).reshape(b, c, h, w)
         return proj(enhanced)
 
+    @staticmethod
+    def shared_confidence(attn):
+        return attn.sum(dim=-1).unsqueeze(-1).unsqueeze(-1)
+
     def fusion_feature(self, x_feat, pca_feat, attn):
-        return x_feat + self.apply(attn, pca_feat, self.apply_proj)
+        shared_base = x_feat * self.shared_confidence(attn)
+        return shared_base + self.apply(attn, pca_feat, self.apply_proj)
 
     def extract(self, fusion_feat, attn):
         return self.apply(attn, fusion_feat, self.extract_proj)
@@ -320,13 +358,21 @@ class FusionHilbertMamba3D(nn.Module):
 
 
 class ACFNet(nn.Module):
-    def __init__(self, pca_channels, aux_channels, num_classes, hidden_dim=64, fusion_scan="hilbert3d"):
+    def __init__(
+        self,
+        pca_channels,
+        aux_channels,
+        num_classes,
+        hidden_dim=64,
+        fusion_scan="hilbert3d",
+        attention_mode="mutual_consistency",
+    ):
         super().__init__()
         self.pca_stem = PCAHilbert3DStem(pca_channels, hidden_dim)
         self.x_stem = RowColumnMamba2DStem(aux_channels, hidden_dim)
 
-        self.pca_enhance = SpatialCrossEnhance(hidden_dim)
-        self.x_enhance = ChannelCrossEnhance(hidden_dim)
+        self.pca_enhance = SpatialCrossEnhance(hidden_dim, attention_mode)
+        self.x_enhance = ChannelCrossEnhance(hidden_dim, attention_mode)
         if fusion_scan == "hilbert3d":
             self.fusion_mamba = FusionHilbertMamba3D(hidden_dim)
         elif fusion_scan == "raster2d":
@@ -334,6 +380,7 @@ class ACFNet(nn.Module):
         else:
             raise ValueError(f"Unsupported fusion scan mode: {fusion_scan}")
         self.fusion_scan = fusion_scan
+        self.attention_mode = attention_mode
 
         self.pca_model = nn.Sequential(
             ConvBlock(hidden_dim, hidden_dim),
