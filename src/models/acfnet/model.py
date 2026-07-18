@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 
+from .HilbertScan3DMambaBlock import Hilbert3d
+
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3):
@@ -39,6 +41,26 @@ def cross_attention_weights(logits, attention_mode):
     return (normalized_mutual * shared_confidence).to(original_dtype)
 
 
+def source_concentration_confidence(attention):
+    """Summarize how confidently each source token is selected."""
+    if attention.ndim != 3:
+        raise ValueError(
+            f"Expected attention with shape [B,T,S], got {tuple(attention.shape)}"
+        )
+
+    original_dtype = attention.dtype
+    work_attention = (
+        attention.float()
+        if original_dtype in (torch.float16, torch.bfloat16)
+        else attention
+    )
+    source_mass = work_attention.sum(dim=-2)
+    source_energy = work_attention.square().sum(dim=-2)
+    eps = torch.finfo(work_attention.dtype).eps
+    confidence = source_energy / source_mass.clamp_min(eps)
+    return confidence.clamp(0.0, 1.0).to(original_dtype)
+
+
 class SpatialCrossEnhance(nn.Module):
     def __init__(self, channels, attention_mode="mutual_consistency"):
         super().__init__()
@@ -52,11 +74,6 @@ class SpatialCrossEnhance(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
         )
-        self.extract_proj = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-        self.res_weight = nn.Parameter(torch.tensor(-2.0))
 
     def attention(self, pca_feat, x_feat):
         _, c, _, _ = pca_feat.shape
@@ -65,28 +82,26 @@ class SpatialCrossEnhance(nn.Module):
         logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(c)
         return cross_attention_weights(logits, self.attention_mode)
 
-    def apply(self, attn, value_feat, proj):
+    def apply(self, attn, value_feat):
         b, c, h, w = value_feat.shape
         v = self.v_proj(value_feat).flatten(2).transpose(1, 2)
         enhanced = torch.matmul(attn, v).transpose(1, 2).reshape(b, c, h, w)
-        return proj(enhanced)
+        return self.apply_proj(enhanced)
 
-    @staticmethod
-    def shared_confidence(attn, height, width):
-        return attn.sum(dim=-1).reshape(attn.shape[0], 1, height, width)
-
-    def fusion_feature(self, pca_feat, x_feat, attn):
-        _, _, h, w = pca_feat.shape
-        shared_base = pca_feat * self.shared_confidence(attn, h, w)
-        return shared_base + self.apply(attn, x_feat, self.apply_proj)
-
-    def extract(self, fusion_feat, attn):
-        return self.apply(attn, fusion_feat, self.extract_proj)
+    def apply_source_confidence(self, attn, source_feat):
+        b, _, h, w = source_feat.shape
+        confidence = source_concentration_confidence(attn)
+        if confidence.shape != (b, h * w):
+            raise ValueError(
+                f"Expected spatial source confidence shape {(b, h * w)}, "
+                f"got {tuple(confidence.shape)}"
+            )
+        transformed = self.apply_proj(self.v_proj(source_feat))
+        return transformed * confidence.reshape(b, 1, h, w)
 
     def forward(self, pca_feat, x_feat):
         attn = self.attention(pca_feat, x_feat)
-        enhanced = self.extract(x_feat, attn)
-        return pca_feat + torch.sigmoid(self.res_weight) * enhanced
+        return self.apply(attn, x_feat), attn
 
 
 class ChannelCrossEnhance(nn.Module):
@@ -102,11 +117,6 @@ class ChannelCrossEnhance(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
         )
-        self.extract_proj = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-        self.res_weight = nn.Parameter(torch.tensor(-2.0))
 
     def attention(self, x_feat, pca_feat):
         _, _, h, w = x_feat.shape
@@ -119,95 +129,47 @@ class ChannelCrossEnhance(nn.Module):
         logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(n)
         return cross_attention_weights(logits, self.attention_mode)
 
-    def apply(self, attn, value_feat, proj):
+    def apply(self, attn, value_feat):
         b, c, h, w = value_feat.shape
         v = self.v_proj(value_feat).flatten(2)
         enhanced = torch.matmul(attn, v).reshape(b, c, h, w)
-        return proj(enhanced)
+        return self.apply_proj(enhanced)
 
-    @staticmethod
-    def shared_confidence(attn):
-        return attn.sum(dim=-1).unsqueeze(-1).unsqueeze(-1)
-
-    def fusion_feature(self, x_feat, pca_feat, attn):
-        shared_base = x_feat * self.shared_confidence(attn)
-        return shared_base + self.apply(attn, pca_feat, self.apply_proj)
-
-    def extract(self, fusion_feat, attn):
-        return self.apply(attn, fusion_feat, self.extract_proj)
+    def apply_source_confidence(self, attn, source_feat):
+        b, c, _, _ = source_feat.shape
+        confidence = source_concentration_confidence(attn)
+        if confidence.shape != (b, c):
+            raise ValueError(
+                f"Expected channel source confidence shape {(b, c)}, "
+                f"got {tuple(confidence.shape)}"
+            )
+        transformed = self.apply_proj(self.v_proj(source_feat))
+        return transformed * confidence.reshape(b, c, 1, 1)
 
     def forward(self, x_feat, pca_feat):
         attn = self.attention(x_feat, pca_feat)
-        enhanced = self.extract(pca_feat, attn)
-        return x_feat + torch.sigmoid(self.res_weight) * enhanced
+        return self.apply(attn, pca_feat), attn
 
 
-def _hilbert_integer_from_point_3d(point, bits):
-    """Map one 3D integer coordinate to its Hilbert-curve distance."""
-    axes = list(point)
-    if len(axes) != 3:
-        raise ValueError(f"Expected a 3D point, got {len(axes)} dimensions")
-    if bits < 1:
-        raise ValueError(f"bits must be positive, got {bits}")
-
-    max_coord = (1 << bits) - 1
-    if any(coord < 0 or coord > max_coord for coord in axes):
-        raise ValueError(f"Point {point} is outside the {bits}-bit Hilbert cube")
-
-    # Inverse undo from John Skilling's transpose representation.
-    q = 1 << (bits - 1)
-    while q > 1:
-        p = q - 1
-        for axis in range(3):
-            if axes[axis] & q:
-                axes[0] ^= p
-            else:
-                t = (axes[0] ^ axes[axis]) & p
-                axes[0] ^= t
-                axes[axis] ^= t
-        q >>= 1
-
-    for axis in range(1, 3):
-        axes[axis] ^= axes[axis - 1]
-
-    t = 0
-    q = 1 << (bits - 1)
-    while q > 1:
-        if axes[2] & q:
-            t ^= q - 1
-        q >>= 1
-    for axis in range(3):
-        axes[axis] ^= t
-
-    distance = 0
-    for bit in range(bits - 1, -1, -1):
-        for axis in range(3):
-            distance = (distance << 1) | ((axes[axis] >> bit) & 1)
-    return distance
-
-
-def hilbert_scan_indices_3d(depth, height, width):
-    """Return flat CDHW indices ordered by a 3D Hilbert curve."""
+def generalized_hilbert_scan_indices_3d(depth, height, width):
+    """Return flat CDHW indices from a generalized Hilbert cuboid traversal."""
     if min(depth, height, width) < 1:
         raise ValueError(f"Volume dimensions must be positive, got {(depth, height, width)}")
 
-    # Embed a non-cubic volume in the smallest power-of-two Hilbert cube and
-    # retain only valid coordinates. This keeps the scan defined for shapes
-    # such as 64 x 11 x 11 without padding the feature tensor itself.
-    bits = max(1, (max(depth, height, width) - 1).bit_length())
-    ordered = []
-    for z in range(depth):
-        for y in range(height):
-            for x in range(width):
-                distance = _hilbert_integer_from_point_3d((z, y, x), bits)
-                flat_index = (z * height + y) * width + x
-                ordered.append((distance, flat_index))
-    ordered.sort(key=lambda item: item[0])
-    return [flat_index for _, flat_index in ordered]
+    indices = [
+        (z * height + y) * width + x
+        for x, y, z in Hilbert3d(width, height, depth)
+    ]
+    expected_length = depth * height * width
+    if len(indices) != expected_length or len(set(indices)) != expected_length:
+        raise RuntimeError(
+            f"Generalized Hilbert traversal is invalid for {(depth, height, width)}"
+        )
+    return indices
 
 
-class Hilbert3DScanner(nn.Module):
-    """Reversibly reorder a BCHW feature volume along a 3D Hilbert curve."""
+class GeneralizedHilbert3DScanner(nn.Module):
+    """Reversibly scan a BCHW cuboid using the generalized Hilbert traversal."""
 
     def __init__(self):
         super().__init__()
@@ -219,7 +181,7 @@ class Hilbert3DScanner(nn.Module):
         index = self._index_cache.get(key)
         if index is None:
             index = torch.tensor(
-                hilbert_scan_indices_3d(depth, height, width),
+                generalized_hilbert_scan_indices_3d(depth, height, width),
                 dtype=torch.long,
                 device=device,
             )
@@ -252,7 +214,7 @@ class Hilbert3DScanner(nn.Module):
 class PCAHilbert3DStem(nn.Module):
     def __init__(self, in_channels, hidden_dim):
         super().__init__()
-        self.scanner = Hilbert3DScanner()
+        self.scanner = GeneralizedHilbert3DScanner()
         self.input_proj = nn.Linear(1, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
         self.mixer = Mamba(d_model=hidden_dim, d_state=16, d_conv=4, expand=2)
@@ -336,7 +298,7 @@ class FusionHilbertMamba3D(nn.Module):
 
     def __init__(self, channels):
         super().__init__()
-        self.scanner = Hilbert3DScanner()
+        self.scanner = GeneralizedHilbert3DScanner()
         self.input_proj = nn.Linear(1, channels)
         self.norm = nn.LayerNorm(channels)
         self.mixer = Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
@@ -357,6 +319,71 @@ class FusionHilbertMamba3D(nn.Module):
         return mixed + self.out_proj(mixed)
 
 
+class CrossModalInteractionBlock(nn.Module):
+    def __init__(
+        self,
+        pca_in_channels,
+        x_in_channels,
+        channels,
+        attention_mode,
+        enhance_mode="direct_cross",
+    ):
+        super().__init__()
+        if enhance_mode not in {"direct_cross", "source_confidence_self"}:
+            raise ValueError(f"Unsupported enhance mode: {enhance_mode}")
+        self.pca_stem = PCAHilbert3DStem(pca_in_channels, channels)
+        self.x_stem = RowColumnMamba2DStem(x_in_channels, channels)
+        self.pca_enhance = SpatialCrossEnhance(channels, attention_mode)
+        self.x_enhance = ChannelCrossEnhance(channels, attention_mode)
+        self.pca_res_weight = nn.Parameter(torch.tensor(-2.0))
+        self.x_res_weight = nn.Parameter(torch.tensor(-2.0))
+        self.enhance_mode = enhance_mode
+
+    def _cross_deltas(self, pca_state, x_state):
+        pca_modeled = self.pca_stem(pca_state)
+        x_modeled = self.x_stem(x_state)
+        if self.enhance_mode == "direct_cross":
+            pca_delta, _ = self.pca_enhance(pca_modeled, x_modeled)
+            x_delta, _ = self.x_enhance(x_modeled, pca_modeled)
+        else:
+            spatial_attention = self.pca_enhance.attention(
+                pca_modeled,
+                x_modeled,
+            )
+            channel_attention = self.x_enhance.attention(
+                x_modeled,
+                pca_modeled,
+            )
+            x_delta = self.pca_enhance.apply_source_confidence(
+                spatial_attention,
+                x_modeled,
+            )
+            pca_delta = self.x_enhance.apply_source_confidence(
+                channel_attention,
+                pca_modeled,
+            )
+        return pca_modeled, x_modeled, pca_delta, x_delta
+
+    def forward(self, pca_state, x_state):
+        pca_modeled, x_modeled, pca_delta, x_delta = self._cross_deltas(
+            pca_state, x_state
+        )
+        pca_next = pca_modeled + torch.sigmoid(self.pca_res_weight) * pca_delta
+        x_next = x_modeled + torch.sigmoid(self.x_res_weight) * x_delta
+        return pca_next, x_next
+
+    def fuse(self, pca_state, x_state):
+        pca_modeled, x_modeled, pca_delta, x_delta = self._cross_deltas(
+            pca_state, x_state
+        )
+        return (
+            pca_modeled
+            + x_modeled
+            + torch.sigmoid(self.pca_res_weight) * pca_delta
+            + torch.sigmoid(self.x_res_weight) * x_delta
+        )
+
+
 class ACFNet(nn.Module):
     def __init__(
         self,
@@ -366,13 +393,38 @@ class ACFNet(nn.Module):
         hidden_dim=64,
         fusion_scan="hilbert3d",
         attention_mode="mutual_consistency",
+        num_interaction_layers=2,
+        enhance_mode="direct_cross",
     ):
         super().__init__()
-        self.pca_stem = PCAHilbert3DStem(pca_channels, hidden_dim)
-        self.x_stem = RowColumnMamba2DStem(aux_channels, hidden_dim)
-
-        self.pca_enhance = SpatialCrossEnhance(hidden_dim, attention_mode)
-        self.x_enhance = ChannelCrossEnhance(hidden_dim, attention_mode)
+        if (
+            isinstance(num_interaction_layers, bool)
+            or not isinstance(num_interaction_layers, int)
+            or num_interaction_layers < 1
+        ):
+            raise ValueError(
+                f"num_interaction_layers must be a positive integer, got {num_interaction_layers}"
+            )
+        interaction_layers = [
+            CrossModalInteractionBlock(
+                pca_channels,
+                aux_channels,
+                hidden_dim,
+                attention_mode,
+                enhance_mode,
+            )
+        ]
+        interaction_layers.extend(
+            CrossModalInteractionBlock(
+                hidden_dim,
+                hidden_dim,
+                hidden_dim,
+                attention_mode,
+                enhance_mode,
+            )
+            for _ in range(num_interaction_layers - 1)
+        )
+        self.interaction_layers = nn.ModuleList(interaction_layers)
         if fusion_scan == "hilbert3d":
             self.fusion_mamba = FusionHilbertMamba3D(hidden_dim)
         elif fusion_scan == "raster2d":
@@ -381,22 +433,8 @@ class ACFNet(nn.Module):
             raise ValueError(f"Unsupported fusion scan mode: {fusion_scan}")
         self.fusion_scan = fusion_scan
         self.attention_mode = attention_mode
-
-        self.pca_model = nn.Sequential(
-            ConvBlock(hidden_dim, hidden_dim),
-            # ConvBlock(hidden_dim, hidden_dim),
-        )
-        self.x_model = nn.Sequential(
-            ConvBlock(hidden_dim, hidden_dim),
-            # ConvBlock(hidden_dim, hidden_dim),
-        )
-
-        self.fusion = nn.Sequential(
-            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.GELU(),
-            ConvBlock(hidden_dim, hidden_dim),
-        )
+        self.num_interaction_layers = num_interaction_layers
+        self.enhance_mode = enhance_mode
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -404,22 +442,11 @@ class ACFNet(nn.Module):
         )
 
     def forward(self, hsi_pca, aux):
-        pca_feat = self.pca_stem(hsi_pca)
-        x_feat = self.x_stem(aux)
+        pca_state = hsi_pca
+        x_state = aux
+        for interaction_layer in self.interaction_layers[:-1]:
+            pca_state, x_state = interaction_layer(pca_state, x_state)
 
-        spatial_attn = self.pca_enhance.attention(pca_feat, x_feat)
-        channel_attn = self.x_enhance.attention(x_feat, pca_feat)
-
-        pca_fusion = self.pca_enhance.fusion_feature(pca_feat, x_feat, spatial_attn)
-        x_fusion = self.x_enhance.fusion_feature(x_feat, pca_feat, channel_attn)
-        fusion_feat = self.fusion_mamba(pca_fusion + x_fusion)
-
-        pca_delta = self.pca_enhance.extract(fusion_feat, spatial_attn)
-        x_delta = self.x_enhance.extract(fusion_feat, channel_attn)
-        pca_enhanced = pca_feat + torch.sigmoid(self.pca_enhance.res_weight) * pca_delta
-        x_enhanced = x_feat + torch.sigmoid(self.x_enhance.res_weight) * x_delta
-
-        pca_out = self.pca_model(pca_enhanced)
-        x_out = self.x_model(x_enhanced)
-        fused = self.fusion(torch.cat([pca_out, x_out], dim=1))
-        return self.classifier(fused)
+        fusion_input = self.interaction_layers[-1].fuse(pca_state, x_state)
+        fusion_feat = self.fusion_mamba(fusion_input)
+        return self.classifier(fusion_feat)
