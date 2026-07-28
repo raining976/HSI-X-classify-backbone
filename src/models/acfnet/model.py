@@ -41,8 +41,8 @@ def cross_attention_weights(logits, attention_mode):
     return (normalized_mutual * shared_confidence).to(original_dtype)
 
 
-def source_concentration_confidence(attention):
-    """Summarize how confidently each source token is selected."""
+def target_concentration_confidence(attention):
+    """Summarize how confidently each target token selects its sources."""
     if attention.ndim != 3:
         raise ValueError(
             f"Expected attention with shape [B,T,S], got {tuple(attention.shape)}"
@@ -54,10 +54,10 @@ def source_concentration_confidence(attention):
         if original_dtype in (torch.float16, torch.bfloat16)
         else attention
     )
-    source_mass = work_attention.sum(dim=-2)
-    source_energy = work_attention.square().sum(dim=-2)
+    target_mass = work_attention.sum(dim=-1)
+    target_energy = work_attention.square().sum(dim=-1)
     eps = torch.finfo(work_attention.dtype).eps
-    confidence = source_energy / source_mass.clamp_min(eps)
+    confidence = target_energy / target_mass.clamp_min(eps)
     return confidence.clamp(0.0, 1.0).to(original_dtype)
 
 
@@ -71,6 +71,13 @@ class SpatialCrossEnhance(nn.Module):
         self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.apply_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.feedback_v_proj = nn.Conv2d(
+            channels, channels, kernel_size=1, bias=False
+        )
+        self.feedback_proj = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
         )
@@ -88,16 +95,11 @@ class SpatialCrossEnhance(nn.Module):
         enhanced = torch.matmul(attn, v).transpose(1, 2).reshape(b, c, h, w)
         return self.apply_proj(enhanced)
 
-    def apply_source_confidence(self, attn, source_feat):
-        b, _, h, w = source_feat.shape
-        confidence = source_concentration_confidence(attn)
-        if confidence.shape != (b, h * w):
-            raise ValueError(
-                f"Expected spatial source confidence shape {(b, h * w)}, "
-                f"got {tuple(confidence.shape)}"
-            )
-        transformed = self.apply_proj(self.v_proj(source_feat))
-        return transformed * confidence.reshape(b, 1, h, w)
+    def extract_feedback(self, attn, fusion_feat):
+        b, c, h, w = fusion_feat.shape
+        value = self.feedback_v_proj(fusion_feat).flatten(2).transpose(1, 2)
+        feedback = torch.matmul(attn, value).transpose(1, 2).reshape(b, c, h, w)
+        return self.feedback_proj(feedback)
 
     def forward(self, pca_feat, x_feat):
         attn = self.attention(pca_feat, x_feat)
@@ -114,6 +116,13 @@ class ChannelCrossEnhance(nn.Module):
         self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.apply_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.feedback_v_proj = nn.Conv2d(
+            channels, channels, kernel_size=1, bias=False
+        )
+        self.feedback_proj = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
         )
@@ -135,16 +144,11 @@ class ChannelCrossEnhance(nn.Module):
         enhanced = torch.matmul(attn, v).reshape(b, c, h, w)
         return self.apply_proj(enhanced)
 
-    def apply_source_confidence(self, attn, source_feat):
-        b, c, _, _ = source_feat.shape
-        confidence = source_concentration_confidence(attn)
-        if confidence.shape != (b, c):
-            raise ValueError(
-                f"Expected channel source confidence shape {(b, c)}, "
-                f"got {tuple(confidence.shape)}"
-            )
-        transformed = self.apply_proj(self.v_proj(source_feat))
-        return transformed * confidence.reshape(b, c, 1, 1)
+    def extract_feedback(self, attn, fusion_feat):
+        b, c, h, w = fusion_feat.shape
+        value = self.feedback_v_proj(fusion_feat).flatten(2)
+        feedback = torch.matmul(attn, value).reshape(b, c, h, w)
+        return self.feedback_proj(feedback)
 
     def forward(self, x_feat, pca_feat):
         attn = self.attention(x_feat, pca_feat)
@@ -212,12 +216,17 @@ class GeneralizedHilbert3DScanner(nn.Module):
 
 
 class PCAHilbert3DStem(nn.Module):
-    def __init__(self, in_channels, hidden_dim):
+    def __init__(self, in_channels, hidden_dim, d_state=16):
         super().__init__()
         self.scanner = GeneralizedHilbert3DScanner()
         self.input_proj = nn.Linear(1, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
-        self.mixer = Mamba(d_model=hidden_dim, d_state=16, d_conv=4, expand=2)
+        self.mixer = Mamba(
+            d_model=hidden_dim,
+            d_state=d_state,
+            d_conv=4,
+            expand=2,
+        )
         self.output_proj = nn.Linear(hidden_dim, 1)
         self.output_block = ConvBlock(in_channels, hidden_dim)
 
@@ -230,14 +239,24 @@ class PCAHilbert3DStem(nn.Module):
 
 
 class RowColumnMamba2DStem(nn.Module):
-    def __init__(self, in_channels, hidden_dim):
+    def __init__(self, in_channels, hidden_dim, d_state=16):
         super().__init__()
         self.input_proj = nn.Linear(in_channels, hidden_dim)
 
         self.row_forward_norm = nn.LayerNorm(hidden_dim)
         self.column_forward_norm = nn.LayerNorm(hidden_dim)
-        self.row_forward_mixer = Mamba(d_model=hidden_dim, d_state=16, d_conv=4, expand=2)
-        self.column_forward_mixer = Mamba(d_model=hidden_dim, d_state=16, d_conv=4, expand=2)
+        self.row_forward_mixer = Mamba(
+            d_model=hidden_dim,
+            d_state=d_state,
+            d_conv=4,
+            expand=2,
+        )
+        self.column_forward_mixer = Mamba(
+            d_model=hidden_dim,
+            d_state=d_state,
+            d_conv=4,
+            expand=2,
+        )
 
         self.direction_fusion = nn.Sequential(
             nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1, bias=False),
@@ -273,10 +292,15 @@ class RowColumnMamba2DStem(nn.Module):
 
 
 class FusionMamba2D(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, d_state=16):
         super().__init__()
         self.norm = nn.LayerNorm(channels)
-        self.mixer = Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
+        self.mixer = Mamba(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=4,
+            expand=2,
+        )
         self.out_proj = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
             nn.BatchNorm2d(channels),
@@ -296,12 +320,17 @@ class FusionMamba2D(nn.Module):
 class FusionHilbertMamba3D(nn.Module):
     """Model a CxHxW fusion volume using a reversible Hilbert-3D scan."""
 
-    def __init__(self, channels):
+    def __init__(self, channels, d_state=16):
         super().__init__()
         self.scanner = GeneralizedHilbert3DScanner()
         self.input_proj = nn.Linear(1, channels)
         self.norm = nn.LayerNorm(channels)
-        self.mixer = Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
+        self.mixer = Mamba(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=4,
+            expand=2,
+        )
         self.output_proj = nn.Linear(channels, 1)
         self.out_proj = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
@@ -319,69 +348,109 @@ class FusionHilbertMamba3D(nn.Module):
         return mixed + self.out_proj(mixed)
 
 
-class CrossModalInteractionBlock(nn.Module):
+def build_fusion_mamba(fusion_scan, channels, d_state):
+    if fusion_scan == "hilbert3d":
+        return FusionHilbertMamba3D(channels, d_state=d_state)
+    if fusion_scan == "raster2d":
+        return FusionMamba2D(channels, d_state=d_state)
+    raise ValueError(f"Unsupported fusion scan mode: {fusion_scan}")
+
+
+class CrossModalFusionBlock(nn.Module):
+    def __init__(
+        self,
+        channels,
+        attention_mode,
+        fusion_scan="hilbert3d",
+        d_state=16,
+        use_concentration=True,
+    ):
+        super().__init__()
+        if not isinstance(use_concentration, bool):
+            raise ValueError(
+                f"use_concentration must be a boolean, got {use_concentration}"
+            )
+        self.pca_enhance = SpatialCrossEnhance(channels, attention_mode)
+        self.x_enhance = ChannelCrossEnhance(channels, attention_mode)
+        self.coarse_fusion = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.fusion_mamba = build_fusion_mamba(fusion_scan, channels, d_state)
+        self.pca_res_weight = nn.Parameter(torch.tensor(-2.0))
+        self.x_res_weight = nn.Parameter(torch.tensor(-2.0))
+        self.fusion_scan = fusion_scan
+        self.use_concentration = use_concentration
+
+    def _joint_context(self, pca_feat, x_feat):
+        pca_cross, spatial_attention = self.pca_enhance(pca_feat, x_feat)
+        x_cross, channel_attention = self.x_enhance(x_feat, pca_feat)
+        pca_temporary = pca_feat + pca_cross
+        x_temporary = x_feat + x_cross
+        coarse_feature = self.coarse_fusion(
+            torch.cat([pca_temporary, x_temporary], dim=1)
+        )
+        joint_feature = self.fusion_mamba(coarse_feature)
+        return joint_feature, spatial_attention, channel_attention
+
+    def forward(self, pca_feat, x_feat):
+        joint_feature, spatial_attention, channel_attention = self._joint_context(
+            pca_feat, x_feat
+        )
+        pca_feedback = self.pca_enhance.extract_feedback(
+            spatial_attention, joint_feature
+        )
+        x_feedback = self.x_enhance.extract_feedback(
+            channel_attention, joint_feature
+        )
+
+        if self.use_concentration:
+            b, _, h, w = pca_feedback.shape
+            pca_confidence = target_concentration_confidence(
+                spatial_attention
+            ).reshape(b, 1, h, w)
+            x_confidence = target_concentration_confidence(
+                channel_attention
+            ).reshape(b, x_feedback.shape[1], 1, 1)
+            pca_feedback = pca_feedback * pca_confidence
+            x_feedback = x_feedback * x_confidence
+
+        pca_next = pca_feat + torch.sigmoid(self.pca_res_weight) * pca_feedback
+        x_next = x_feat + torch.sigmoid(self.x_res_weight) * x_feedback
+        return pca_next, x_next
+
+
+class CrossModalInteractionStage(nn.Module):
     def __init__(
         self,
         pca_in_channels,
         x_in_channels,
         channels,
         attention_mode,
-        enhance_mode="direct_cross",
+        fusion_scan="hilbert3d",
+        d_state=16,
+        use_concentration=True,
     ):
         super().__init__()
-        if enhance_mode not in {"direct_cross", "source_confidence_self"}:
-            raise ValueError(f"Unsupported enhance mode: {enhance_mode}")
-        self.pca_stem = PCAHilbert3DStem(pca_in_channels, channels)
-        self.x_stem = RowColumnMamba2DStem(x_in_channels, channels)
-        self.pca_enhance = SpatialCrossEnhance(channels, attention_mode)
-        self.x_enhance = ChannelCrossEnhance(channels, attention_mode)
-        self.pca_res_weight = nn.Parameter(torch.tensor(-2.0))
-        self.x_res_weight = nn.Parameter(torch.tensor(-2.0))
-        self.enhance_mode = enhance_mode
-
-    def _cross_deltas(self, pca_state, x_state):
-        pca_modeled = self.pca_stem(pca_state)
-        x_modeled = self.x_stem(x_state)
-        if self.enhance_mode == "direct_cross":
-            pca_delta, _ = self.pca_enhance(pca_modeled, x_modeled)
-            x_delta, _ = self.x_enhance(x_modeled, pca_modeled)
-        else:
-            spatial_attention = self.pca_enhance.attention(
-                pca_modeled,
-                x_modeled,
-            )
-            channel_attention = self.x_enhance.attention(
-                x_modeled,
-                pca_modeled,
-            )
-            x_delta = self.pca_enhance.apply_source_confidence(
-                spatial_attention,
-                x_modeled,
-            )
-            pca_delta = self.x_enhance.apply_source_confidence(
-                channel_attention,
-                pca_modeled,
-            )
-        return pca_modeled, x_modeled, pca_delta, x_delta
+        self.pca_stem = PCAHilbert3DStem(
+            pca_in_channels, channels, d_state=d_state
+        )
+        self.x_stem = RowColumnMamba2DStem(
+            x_in_channels, channels, d_state=d_state
+        )
+        self.fusion = CrossModalFusionBlock(
+            channels=channels,
+            attention_mode=attention_mode,
+            fusion_scan=fusion_scan,
+            d_state=d_state,
+            use_concentration=use_concentration,
+        )
 
     def forward(self, pca_state, x_state):
-        pca_modeled, x_modeled, pca_delta, x_delta = self._cross_deltas(
-            pca_state, x_state
-        )
-        pca_next = pca_modeled + torch.sigmoid(self.pca_res_weight) * pca_delta
-        x_next = x_modeled + torch.sigmoid(self.x_res_weight) * x_delta
-        return pca_next, x_next
-
-    def fuse(self, pca_state, x_state):
-        pca_modeled, x_modeled, pca_delta, x_delta = self._cross_deltas(
-            pca_state, x_state
-        )
-        return (
-            pca_modeled
-            + x_modeled
-            + torch.sigmoid(self.pca_res_weight) * pca_delta
-            + torch.sigmoid(self.x_res_weight) * x_delta
-        )
+        pca_feat = self.pca_stem(pca_state)
+        x_feat = self.x_stem(x_state)
+        return self.fusion(pca_feat, x_feat)
 
 
 class ACFNet(nn.Module):
@@ -394,7 +463,8 @@ class ACFNet(nn.Module):
         fusion_scan="hilbert3d",
         attention_mode="mutual_consistency",
         num_interaction_layers=2,
-        enhance_mode="direct_cross",
+        d_state=16,
+        use_concentration=True,
     ):
         super().__init__()
         if (
@@ -405,36 +475,54 @@ class ACFNet(nn.Module):
             raise ValueError(
                 f"num_interaction_layers must be a positive integer, got {num_interaction_layers}"
             )
+        if isinstance(d_state, bool) or not isinstance(d_state, int) or d_state < 1:
+            raise ValueError(f"d_state must be a positive integer, got {d_state}")
+        if not isinstance(use_concentration, bool):
+            raise ValueError(
+                f"use_concentration must be a boolean, got {use_concentration}"
+            )
         interaction_layers = [
-            CrossModalInteractionBlock(
-                pca_channels,
-                aux_channels,
-                hidden_dim,
-                attention_mode,
-                enhance_mode,
+            CrossModalInteractionStage(
+                pca_in_channels=pca_channels,
+                x_in_channels=aux_channels,
+                channels=hidden_dim,
+                attention_mode=attention_mode,
+                fusion_scan=fusion_scan,
+                d_state=d_state,
+                use_concentration=use_concentration,
             )
         ]
         interaction_layers.extend(
-            CrossModalInteractionBlock(
-                hidden_dim,
-                hidden_dim,
-                hidden_dim,
-                attention_mode,
-                enhance_mode,
+            CrossModalInteractionStage(
+                pca_in_channels=hidden_dim,
+                x_in_channels=hidden_dim,
+                channels=hidden_dim,
+                attention_mode=attention_mode,
+                fusion_scan=fusion_scan,
+                d_state=d_state,
+                use_concentration=use_concentration,
             )
             for _ in range(num_interaction_layers - 1)
         )
         self.interaction_layers = nn.ModuleList(interaction_layers)
-        if fusion_scan == "hilbert3d":
-            self.fusion_mamba = FusionHilbertMamba3D(hidden_dim)
-        elif fusion_scan == "raster2d":
-            self.fusion_mamba = FusionMamba2D(hidden_dim)
-        else:
-            raise ValueError(f"Unsupported fusion scan mode: {fusion_scan}")
+        self.final_fusion_proj = nn.Sequential(
+            nn.Conv2d(
+                hidden_dim * 2,
+                hidden_dim,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+        )
+        self.final_fusion_mamba = build_fusion_mamba(
+            fusion_scan, hidden_dim, d_state
+        )
         self.fusion_scan = fusion_scan
         self.attention_mode = attention_mode
         self.num_interaction_layers = num_interaction_layers
-        self.enhance_mode = enhance_mode
+        self.d_state = d_state
+        self.use_concentration = use_concentration
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -444,9 +532,11 @@ class ACFNet(nn.Module):
     def forward(self, hsi_pca, aux):
         pca_state = hsi_pca
         x_state = aux
-        for interaction_layer in self.interaction_layers[:-1]:
+        for interaction_layer in self.interaction_layers:
             pca_state, x_state = interaction_layer(pca_state, x_state)
 
-        fusion_input = self.interaction_layers[-1].fuse(pca_state, x_state)
-        fusion_feat = self.fusion_mamba(fusion_input)
+        fusion_feat = self.final_fusion_proj(
+            torch.cat([pca_state, x_state], dim=1)
+        )
+        fusion_feat = self.final_fusion_mamba(fusion_feat)
         return self.classifier(fusion_feat)
