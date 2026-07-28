@@ -29,11 +29,29 @@ def build_model(config, dataset_type, device):
     return {"net": net, "x_proto": x_proto, "l_proto": l_proto}
 
 
+def _ensure_prototypes(bundle, batch):
+    if "x_proto" in bundle and "l_proto" in bundle:
+        return
+
+    net = bundle["net"]
+    device = batch["hsi_pca"].device
+    dim = net.dim
+    num_classes = net.nn.out_features
+    x_proto = torch.empty(num_classes, dim, device=device)
+    torch.nn.init.normal_(x_proto, mean=0, std=0.2)
+    l_proto = torch.empty(num_classes, dim, device=device)
+    torch.nn.init.normal_(l_proto, mean=0, std=0.2)
+    bundle["x_proto"] = x_proto
+    bundle["l_proto"] = l_proto
+
+
 def forward_train(bundle, batch):
+    _ensure_prototypes(bundle, batch)
     logits, _, _ = bundle["net"](batch["hsi_pca"], batch["aux"], bundle["x_proto"], bundle["l_proto"], None)
     return logits
 
 
 def forward_eval(bundle, batch):
+    _ensure_prototypes(bundle, batch)
     logits, _, _ = bundle["net"](batch["hsi_pca"], batch["aux"], bundle["x_proto"], bundle["l_proto"], None)
     return logits

@@ -25,7 +25,7 @@ class DWT_2D(Module):
         assert self.band_length % 2 == 0
         self.band_length_half = math.floor(self.band_length / 2)
 
-    def get_matrix(self):
+    def get_matrix(self, device):
         L1 = np.max((self.input_height, self.input_width))
         L = math.floor(L1 / 2)
         matrix_h = np.zeros((L, L1 + self.band_length - 2))
@@ -57,16 +57,10 @@ class DWT_2D(Module):
         matrix_g_1 = matrix_g_1[:, (self.band_length_half - 1):end]
         matrix_g_1 = np.transpose(matrix_g_1)
 
-        if torch.cuda.is_available():
-            self.matrix_low_0 = torch.Tensor(matrix_h_0).cuda()
-            self.matrix_low_1 = torch.Tensor(matrix_h_1).cuda()
-            self.matrix_high_0 = torch.Tensor(matrix_g_0).cuda()
-            self.matrix_high_1 = torch.Tensor(matrix_g_1).cuda()
-        else:
-            self.matrix_low_0 = torch.Tensor(matrix_h_0)
-            self.matrix_low_1 = torch.Tensor(matrix_h_1)
-            self.matrix_high_0 = torch.Tensor(matrix_g_0)
-            self.matrix_high_1 = torch.Tensor(matrix_g_1)
+        self.matrix_low_0 = torch.as_tensor(matrix_h_0, dtype=torch.float32, device=device)
+        self.matrix_low_1 = torch.as_tensor(matrix_h_1, dtype=torch.float32, device=device)
+        self.matrix_high_0 = torch.as_tensor(matrix_g_0, dtype=torch.float32, device=device)
+        self.matrix_high_1 = torch.as_tensor(matrix_g_1, dtype=torch.float32, device=device)
 
     def forward(self, input):
         r"""
@@ -80,7 +74,7 @@ class DWT_2D(Module):
         assert len(input.size()) == 4
         self.input_height = input.size()[-2]
         self.input_width = input.size()[-1]
-        self.get_matrix()
+        self.get_matrix(input.device)
         return DWTFunction_2D.apply(input, self.matrix_low_0, self.matrix_low_1, self.matrix_high_0, self.matrix_high_1)
 
 

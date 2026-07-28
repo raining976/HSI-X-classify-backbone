@@ -5,7 +5,6 @@ MODEL_NAME = "SSFuseMamba"
 
 
 def build_model(config, dataset_type, device):
-    hsi_channels = config.get_value('data_channels')[dataset_type]
     pca_channels = config.get_value('channels')
     aux_channels = config.get_value('lidar_or_sar_channels')[dataset_type]
     num_classes = config.get_value('out_features')[dataset_type]
@@ -14,9 +13,8 @@ def build_model(config, dataset_type, device):
         pca_channels=pca_channels,
         aux_channels=aux_channels,
         num_classes=num_classes,
-        hsi_channels=hsi_channels,
-        embed_dim=48,
-        stem_dim=32,
+        embed_dim=32,
+        stem_dim=24,
         stage_depths=tuple(stage_depths),
     )
     return {"net": net}
@@ -24,7 +22,6 @@ def build_model(config, dataset_type, device):
 
 def forward_train(bundle, batch):
     return bundle["net"](
-        batch["hsi"],
         batch["hsi_pca"].squeeze(1),
         batch["aux"],
     )
@@ -32,7 +29,6 @@ def forward_train(bundle, batch):
 
 def forward_eval(bundle, batch):
     return bundle["net"](
-        batch["hsi"],
         batch["hsi_pca"].squeeze(1),
         batch["aux"],
     )

@@ -29,6 +29,13 @@ def _limit_dataloader_samples(loader, max_samples):
     )
 
 
+def _move_bundle_to_device(model_bundle, device):
+    model_bundle["net"].to(device)
+    for key, value in list(model_bundle.items()):
+        if key != "net" and torch.is_tensor(value):
+            model_bundle[key] = value.to(device)
+
+
 def myTest(datasetType, model, max_test_samples=None):
     """测试函数，从配置系统获取参数"""
     cuda = config.get_value('cuda')
@@ -53,9 +60,24 @@ def myTest(datasetType, model, max_test_samples=None):
 
     print(f"测试参数: cuda={cuda}, visualization={visualization}, tsne={tsne}")
 
-    net = torch.load(model_savepath[datasetType])
+    checkpoint_path = model_savepath[datasetType]
+    try:
+        loaded_model = torch.load(checkpoint_path, map_location=device)
+    except RuntimeError as exc:
+        if "PytorchStreamReader failed reading zip archive" in str(exc):
+            raise RuntimeError(
+                f"模型文件可能损坏或未完整写入: {checkpoint_path}. "
+                "请删除该 .pth 后重新训练生成 checkpoint。"
+            ) from exc
+        raise
     model_adapter = get_model_adapter(model)
-    model_bundle = {"net": net}
+    if isinstance(loaded_model, dict) and "net" in loaded_model:
+        model_bundle = loaded_model
+        net = model_bundle["net"]
+    else:
+        net = loaded_model
+        model_bundle = {"net": net}
+    _move_bundle_to_device(model_bundle, device)
     set_random_seed(random_seed)
     train_loader, test_loader, trntst_loader, all_loader, hsi_pca_wight = getMyData(datasetType, channels, windowSize, batch_size, num_workers)
     test_loader = _limit_dataloader_samples(test_loader, max_test_samples)

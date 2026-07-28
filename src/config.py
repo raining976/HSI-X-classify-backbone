@@ -7,7 +7,7 @@ import os
 import json
 import argparse
 from dataclasses import dataclass, asdict, field
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 from pathlib import Path
 
 from .model_registry import MODEL_REGISTRY
@@ -29,14 +29,68 @@ DATASET_LABELS = {
     7: "LN02",
 }
 
+
+def _strip_json_comments(text: str) -> str:
+    """Remove JSONC // and /* */ comments while preserving string content."""
+    result = []
+    index = 0
+    in_string = False
+    escaped = False
+
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+            continue
+
+        if char == "/" and next_char == "*":
+            index += 2
+            while index + 1 < len(text) and not (text[index] == "*" and text[index + 1] == "/"):
+                result.append("\n" if text[index] in "\r\n" else " ")
+                index += 1
+            index += 2
+            continue
+
+        result.append(char)
+        index += 1
+
+    return "".join(result)
+
+
+def load_json_or_jsonc(path: str) -> Dict[str, Any]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.loads(_strip_json_comments(f.read()))
+
+
 @dataclass
 class ExperimentConfig:
     """实验配置类，包含所有需要的参数"""
 
     # 基本实验设置
     experiment_name: str = "default_experiment"
-    dataset_type: int = 3  # 0-7 对应不同数据集
-    model_name: str = "FusAtNet"
+    dataset_type: Union[int, List[int]] = 3  # 0-7 对应不同数据集；可传列表批量运行
+    model_name: Union[str, List[str]] = "FusAtNet"
     cuda_device: str = "cuda:0"
 
     # 训练参数
@@ -51,7 +105,16 @@ class ExperimentConfig:
     channels: int = 30
     window_size: int = 11
     depth: List[List[int]] = None
+    stage_depths: List[int] = None
+    stage_dims: List[int] = None
+    # Backward-compatible alias for older config files.
     ssfuse_mamba_stage_depths: List[int] = None
+    cross_attention_mode: str = "channel"
+    acfnet_attention_mode: str = "mutual_consistency"
+    acfnet_num_interaction_layers: int = 2
+    acfnet_fusion_scan: str = "hilbert3d"
+    acfnet_d_state: int = 16
+    acfnet_use_concentration: bool = True
 
     # 优化参数（默认保持原始训练策略，避免影响对比实验）
     optimizer_name: str = "adam"
@@ -88,14 +151,20 @@ class ExperimentConfig:
         """初始化后自动设置默认值"""
         if self.depth is None:
             self.depth = [[2, 2, 2], [2, 2, 2], 2]
-        if self.ssfuse_mamba_stage_depths is None:
-            self.ssfuse_mamba_stage_depths = [2, 2, 2]
+        if self.stage_depths is None:
+            self.stage_depths = self.ssfuse_mamba_stage_depths or [2, 2, 2]
+        self.ssfuse_mamba_stage_depths = self.stage_depths
 
         # 数据集相关配置
         self._setup_dataset_config()
 
-        # 自动生成路径
-        self._setup_paths()
+        # 批量配置会在 runner 中展开成单个实验后再生成路径。
+        if self.is_scalar_experiment():
+            self._setup_paths()
+
+    def is_scalar_experiment(self) -> bool:
+        """判断当前配置是否只描述一个 dataset/model 实验。"""
+        return not isinstance(self.dataset_type, list) and not isinstance(self.model_name, list)
 
     def _setup_dataset_config(self):
         """根据数据集类型设置相关配置"""
@@ -117,6 +186,9 @@ class ExperimentConfig:
             "Houston2013", "Houston2018", "Trento", "Berlin",
             "Augsburg", "YellowRiverEstuary", "LN01", "LN02"
         ]
+
+        if not self.is_scalar_experiment():
+            return
 
         dataset_name = dataset_names[self.dataset_type]
 
@@ -154,7 +226,15 @@ class ConfigManager:
             'windowSize': self.config.window_size,
             'out_features': self.config.out_features,
             'depth': self.config.depth,
-            'ssfuse_mamba_stage_depths': self.config.ssfuse_mamba_stage_depths,
+            'stage_depths': self.config.stage_depths,
+            'stage_dims': self.config.stage_dims,
+            'ssfuse_mamba_stage_depths': self.config.stage_depths,
+            'cross_attention_mode': self.config.cross_attention_mode,
+            'acfnet_attention_mode': self.config.acfnet_attention_mode,
+            'acfnet_num_interaction_layers': self.config.acfnet_num_interaction_layers,
+            'acfnet_fusion_scan': self.config.acfnet_fusion_scan,
+            'acfnet_d_state': self.config.acfnet_d_state,
+            'acfnet_use_concentration': self.config.acfnet_use_concentration,
 
             # 训练参数
             'cuda': self.config.cuda_device,
@@ -239,6 +319,26 @@ class ConfigManager:
             self.config.warmup_epochs = value
         elif key == 'min_lr':
             self.config.min_learning_rate = value
+        elif key == 'stage_depths':
+            self.config.stage_depths = value
+            self.config.ssfuse_mamba_stage_depths = value
+        elif key == 'stage_dims':
+            self.config.stage_dims = value
+        elif key == 'ssfuse_mamba_stage_depths':
+            self.config.stage_depths = value
+            self.config.ssfuse_mamba_stage_depths = value
+        elif key == 'cross_attention_mode':
+            self.config.cross_attention_mode = value
+        elif key == 'acfnet_attention_mode':
+            self.config.acfnet_attention_mode = value
+        elif key == 'acfnet_num_interaction_layers':
+            self.config.acfnet_num_interaction_layers = value
+        elif key == 'acfnet_fusion_scan':
+            self.config.acfnet_fusion_scan = value
+        elif key == 'acfnet_d_state':
+            self.config.acfnet_d_state = value
+        elif key == 'acfnet_use_concentration':
+            self.config.acfnet_use_concentration = value
 
         # 重新创建参数字典以确保同步
         self._parameter_dict = self._create_parameter_dict()
@@ -250,7 +350,14 @@ class ConfigManager:
             f'experiment_name:\t{self.config.experiment_name}\n'
             f'model_name:\t{self.config.model_name}\n'
             f'dataset_name:\t{DATASET_LABELS[self.config.dataset_type]}\n'
-            f'ssfuse_mamba_stage_depths:\t{self.config.ssfuse_mamba_stage_depths}\n'
+            f'stage_depths:\t{self.config.stage_depths}\n'
+            f'stage_dims:\t{self.config.stage_dims}\n'
+            f'cross_attention_mode:\t{self.config.cross_attention_mode}\n'
+            f'acfnet_attention_mode:\t{self.config.acfnet_attention_mode}\n'
+            f'acfnet_num_interaction_layers:\t{self.config.acfnet_num_interaction_layers}\n'
+            f'acfnet_fusion_scan:\t{self.config.acfnet_fusion_scan}\n'
+            f'acfnet_d_state:\t{self.config.acfnet_d_state}\n'
+            f'acfnet_use_concentration:\t{self.config.acfnet_use_concentration}\n'
             f'lr:\t{self.config.learning_rate}\n'
             f'epoch_nums:\t{self.config.epochs}\n'
             f'batch_size:\t{self.config.batch_size}\n'
@@ -270,13 +377,13 @@ class ConfigManager:
     def save_config(self, path: str) -> None:
         """保存配置到文件"""
         config_dict = asdict(self.config)
+        config_dict.pop('ssfuse_mamba_stage_depths', None)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
     def load_config(self, path: str) -> None:
         """从文件加载配置"""
-        with open(path, 'r', encoding='utf-8') as f:
-            config_dict = json.load(f)
+        config_dict = load_json_or_jsonc(path)
 
         self.config = ExperimentConfig(**config_dict)
         self._parameter_dict = self._create_parameter_dict()
@@ -424,13 +531,14 @@ def create_experiment_config_from_cli() -> ExperimentConfig:
 
     args = parser.parse_args()
 
-    default_config_path = PROJECT_ROOT / 'configs' / 'train.json'
+    default_config_paths = [
+        PROJECT_ROOT / 'configs' / 'train.json',
+        PROJECT_ROOT / 'configs' / 'train.jsonc',
+    ]
     if args.config:
         config_path = Path(args.config)
-    elif default_config_path.exists():
-        config_path = default_config_path
     else:
-        config_path = None
+        config_path = next((path for path in default_config_paths if path.exists()), None)
 
     if config_path and config_path.exists():
         manager = ConfigManager()

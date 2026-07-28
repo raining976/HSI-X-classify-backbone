@@ -57,7 +57,7 @@ class MultiScaleConvBlock(nn.Module):
 
 # --- 步骤 2: 更新主网络以使用新的多尺度模块 ---
 class CNNet(nn.Module):
-    def __init__(self, c1, c2, branch_out_channels=128, num_classes=10):
+    def __init__(self, c1, c2, branch_out_channels=128, num_classes=10, patch_size=11):
         """
         Args:
             c1 (int): 输入1的通道数
@@ -77,7 +77,7 @@ class CNNet(nn.Module):
         self.flatten = nn.Flatten()
 
         # 计算全连接层的输入维度 (与之前相同)
-        fc_input_features = (branch_out_channels + branch_out_channels) * 11 * 11
+        fc_input_features = (branch_out_channels + branch_out_channels) * patch_size * patch_size
 
         # 全连接分类器
         self.classifier = nn.Linear(in_features=fc_input_features, out_features=num_classes)

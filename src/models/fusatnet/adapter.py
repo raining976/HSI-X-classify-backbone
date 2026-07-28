@@ -14,9 +14,17 @@ def build_model(config, dataset_type, device):
     return {"net": net}
 
 
+def _to_class_logits(outputs):
+    if outputs.dim() == 1:
+        return outputs.unsqueeze(0)
+    if outputs.dim() > 2:
+        return outputs.mean(dim=tuple(range(2, outputs.dim())))
+    return outputs
+
+
 def forward_train(bundle, batch):
-    return bundle["net"](batch["hsi_pca"].squeeze(1), batch["aux"])
+    return _to_class_logits(bundle["net"](batch["hsi_pca"].squeeze(1), batch["aux"]))
 
 
 def forward_eval(bundle, batch):
-    return bundle["net"](batch["hsi_pca"].squeeze(1), batch["aux"])
+    return _to_class_logits(bundle["net"](batch["hsi_pca"].squeeze(1), batch["aux"]))

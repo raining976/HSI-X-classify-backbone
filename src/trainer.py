@@ -77,6 +77,132 @@ def _format_parameter_count(net):
     )
 
 
+def _format_large_count(value):
+    if value >= 1_000_000_000:
+        return f'{value / 1_000_000_000:.3f}G'
+    if value >= 1_000_000:
+        return f'{value / 1_000_000:.3f}M'
+    if value >= 1_000:
+        return f'{value / 1_000:.3f}K'
+    return str(value)
+
+
+def _is_mamba_module(module):
+    module_path = module.__class__.__module__
+    return module.__class__.__name__ == 'Mamba' and module_path.startswith('mamba_ssm.')
+
+
+def _estimate_mamba_macs(module, inputs):
+    if not inputs or not torch.is_tensor(inputs[0]) or inputs[0].ndim != 3:
+        return 0
+
+    tokens = inputs[0]
+    token_count = tokens.numel() // tokens.shape[-1]
+    d_model = tokens.shape[-1]
+    d_inner = module.d_inner
+    d_state = module.d_state
+    d_conv = module.d_conv
+    dt_rank = module.dt_rank
+
+    in_projection = token_count * d_model * (2 * d_inner)
+    depthwise_convolution = token_count * d_inner * d_conv
+    state_projection = token_count * d_inner * (dt_rank + 2 * d_state)
+    time_projection = token_count * dt_rank * d_inner
+    selective_scan = token_count * 4 * d_inner * d_state
+    output_gate = token_count * d_inner
+    out_projection = token_count * d_inner * d_model
+    return (
+        in_projection
+        + depthwise_convolution
+        + state_projection
+        + time_projection
+        + selective_scan
+        + output_gate
+        + out_projection
+    )
+
+
+def _estimate_model_compute(model_adapter, model_bundle, net, train_loader, device):
+    conv_linear_macs = 0
+    mamba_macs = 0
+    handles = []
+
+    def conv_hook(module, inputs, output):
+        nonlocal conv_linear_macs
+        if not torch.is_tensor(output):
+            return
+        kernel_ops = module.weight.shape[2:].numel() * (module.in_channels // module.groups)
+        conv_linear_macs += output.numel() * kernel_ops
+
+    def linear_hook(module, inputs, output):
+        nonlocal conv_linear_macs
+        if torch.is_tensor(output):
+            conv_linear_macs += output.numel() * module.in_features
+
+    def mamba_hook(module, inputs, _output):
+        nonlocal mamba_macs
+        mamba_macs += _estimate_mamba_macs(module, inputs)
+
+    mamba_modules = [module for module in net.modules() if _is_mamba_module(module)]
+    mamba_child_ids = {
+        id(child)
+        for mamba_module in mamba_modules
+        for child in mamba_module.modules()
+        if child is not mamba_module
+    }
+
+    for module in net.modules():
+        if _is_mamba_module(module):
+            handles.append(module.register_forward_hook(mamba_hook))
+        elif id(module) in mamba_child_ids:
+            continue
+        elif isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            handles.append(module.register_forward_hook(conv_hook))
+        elif isinstance(module, nn.Linear):
+            handles.append(module.register_forward_hook(linear_hook))
+
+    was_training = net.training
+    error = None
+    try:
+        hsi_pca, hsi, sar, tr_labels = next(iter(train_loader))
+        batch = {
+            "hsi_pca": hsi_pca[:1].to(device),
+            "hsi": hsi[:1].to(device),
+            "aux": sar[:1].to(device),
+            "label": tr_labels[:1].to(device),
+        }
+        net.eval()
+        with torch.no_grad():
+            model_adapter.forward_train(model_bundle, batch)
+    except Exception as exc:
+        error = exc
+    finally:
+        for handle in handles:
+            handle.remove()
+        if was_training:
+            net.train()
+
+    if error is not None:
+        return f'model compute: unavailable ({error})'
+
+    macs = conv_linear_macs + mamba_macs
+    flops = macs * 2
+    return (
+        'model compute: '
+        f'MACs={_format_large_count(macs)}, '
+        f'FLOPs={_format_large_count(flops)} '
+        f'(per sample, approximate; conv/linear={_format_large_count(conv_linear_macs)}, '
+        f'Mamba={_format_large_count(mamba_macs)})'
+    )
+
+
+def _atomic_torch_save(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
 def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, model_savepath, log_path, hsi_pca_wight, datasetType):
     device = torch.device(cuda if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -90,7 +216,9 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
     net = model_bundle["net"]
     net.to(device)
     param_count_log = _format_parameter_count(net)
+    compute_log = _estimate_model_compute(model_adapter, model_bundle, net, train_loader, device)
     print(param_count_log)
+    print(compute_log)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=config.get_value('label_smoothing') or 0.0)
     optimizer = _build_optimizer(net, lr)
@@ -119,6 +247,7 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
     getLog(log_path, '-------------------Started Training-------------------')
     getLog(log_path, current_time_log)
     getLog(log_path, param_count_log)
+    getLog(log_path, compute_log)
 
     config.set_value('actual_epoch_nums', 0)
     for epoch in range(epochs):
@@ -175,8 +304,8 @@ def train(epochs, lr, model, cuda, train_loader, test_loader, out_features, mode
             config.set_value('actual_epoch_nums', epoch + 1)
 
             if acc1 > max_acc:
-                os.makedirs(os.path.dirname(model_savepath), exist_ok=True)
-                torch.save(net, model_savepath)
+                save_obj = model_bundle if set(model_bundle.keys()) != {"net"} else net
+                _atomic_torch_save(save_obj, model_savepath)
                 max_acc = acc1
 
             time_elapsed = time.time() - since
